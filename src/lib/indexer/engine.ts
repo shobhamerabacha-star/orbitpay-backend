@@ -89,6 +89,22 @@ class QuarantineError extends Error {
   }
 }
 
+const KNOWN_TOPICS: Record<string, string[]> = {
+  treasury: [
+    'TreasuryDeposit', 'TreasuryWithdrawal', 'Deposit', 'Withdrawal', 'Withdraw',
+    'SignerAdded', 'SignerRemoved', 'AdminUpdated',
+  ],
+  payrollStream: [
+    'StreamCreated', 'StreamClaimed', 'StreamCancelled', 'StreamPaused', 'StreamResumed',
+  ],
+  vesting: [
+    'VestingCreated', 'VestingClaimed', 'VestingRevoked', 'VestingFullyClaimed',
+  ],
+  governance: [
+    'ProposalCreated', 'VoteCast', 'ProposalFinalized', 'ProposalExecuted', 'ProposalCancelled',
+  ],
+};
+
 const upsertEvent = async (
   event: DecodedEvent,
   tx: TxPrisma = prisma,
@@ -96,6 +112,9 @@ const upsertEvent = async (
   const data = event.data;
 
   if (event.contractId === config.contracts.treasury) {
+    if (!KNOWN_TOPICS.treasury.includes(event.topic)) {
+      throw new QuarantineError(`Unknown topic '${event.topic}' for treasury contract ${event.contractId}`);
+    }
     const rawAmount = extractAmount(data);
     const rawProposalId = extractProposalId(data);
     await tx.treasuryEvent.upsert({
@@ -118,6 +137,9 @@ const upsertEvent = async (
   }
 
   if (event.contractId === config.contracts.payrollStream) {
+    if (!KNOWN_TOPICS.payrollStream.includes(event.topic)) {
+      throw new QuarantineError(`Unknown topic '${event.topic}' for payroll contract ${event.contractId}`);
+    }
     const streamId = extractStreamId(data);
     if (streamId === null && event.topic === 'StreamCreated') {
       throw new QuarantineError('StreamCreated event missing stream_id');
@@ -182,6 +204,9 @@ const upsertEvent = async (
   }
 
   if (event.contractId === config.contracts.vesting) {
+    if (!KNOWN_TOPICS.vesting.includes(event.topic)) {
+      throw new QuarantineError(`Unknown topic '${event.topic}' for vesting contract ${event.contractId}`);
+    }
     const scheduleId = `v-${data.schedule_id ?? data.scheduleId ?? event.eventId}`;
     const statusMap: Record<string, string> = {
       VestingCreated: 'active',
@@ -208,6 +233,9 @@ const upsertEvent = async (
   }
 
   if (event.contractId === config.contracts.governance) {
+    if (!KNOWN_TOPICS.governance.includes(event.topic)) {
+      throw new QuarantineError(`Unknown topic '${event.topic}' for governance contract ${event.contractId}`);
+    }
     const proposalId = `p-${data.proposal_id ?? data.proposalId ?? event.eventId}`;
     const statusMap: Record<string, string> = {
       ProposalCreated: 'active',
@@ -381,10 +409,30 @@ export const createIndexerEngine = () => {
         observedLedger.set(latestLedger);
 
         const events: DecodedEvent[] = [];
+        let decodeFailureCount = 0;
+
         for (const rawEvent of response.events) {
           const decoded = decodeEventData(rawEvent as SorobanRpc.Api.EventResponse & Record<string, unknown>);
           if (decoded) {
             events.push(decoded);
+          } else {
+            decodeFailureCount++;
+            const contract = String((rawEvent as any)?.contractId ?? 'unknown');
+            decodeFailures.inc({ contract });
+            const rawLedger = typeof (rawEvent as any)?.ledger === 'number' ? (rawEvent as any).ledger : 0;
+            const rawTxHash = String((rawEvent as any)?.txHash ?? 'unknown');
+            const rawEventId = String((rawEvent as any)?.id ?? `invalid-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+            await prisma.deadLetterEvent.create({
+              data: {
+                eventId: rawEventId,
+                ledger: rawLedger,
+                txHash: rawTxHash,
+                contractId: contract,
+                topic: 'DECODE_FAILURE',
+                rawData: (rawEvent ?? {}) as unknown as Prisma.InputJsonValue,
+                error: 'Visible decode failure: missing or invalid event envelope or unparsable ScVal XDR payload',
+              },
+            });
           }
         }
 
@@ -402,7 +450,11 @@ export const createIndexerEngine = () => {
           state.currentLedger = maxAppliedLedger;
 
           console.log(
-            `Indexed ledger ${startLedger ?? 'latest'}: ${processed} events, ${quarantined} quarantined`,
+            `Indexed ledger ${startLedger ?? 'latest'}: ${processed} events, ${quarantined + decodeFailureCount} quarantined`,
+          );
+        } else if (decodeFailureCount > 0) {
+          console.log(
+            `Indexed ledger ${startLedger ?? 'latest'}: 0 events, ${decodeFailureCount} quarantined`,
           );
         } else if (startLedger !== undefined) {
           await prisma.indexerState.upsert({

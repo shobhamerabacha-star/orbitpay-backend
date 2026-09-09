@@ -73,9 +73,27 @@ class QuarantineError extends Error {
         this.name = 'QuarantineError';
     }
 }
+const KNOWN_TOPICS = {
+    treasury: [
+        'TreasuryDeposit', 'TreasuryWithdrawal', 'Deposit', 'Withdrawal', 'Withdraw',
+        'SignerAdded', 'SignerRemoved', 'AdminUpdated',
+    ],
+    payrollStream: [
+        'StreamCreated', 'StreamClaimed', 'StreamCancelled', 'StreamPaused', 'StreamResumed',
+    ],
+    vesting: [
+        'VestingCreated', 'VestingClaimed', 'VestingRevoked', 'VestingFullyClaimed',
+    ],
+    governance: [
+        'ProposalCreated', 'VoteCast', 'ProposalFinalized', 'ProposalExecuted', 'ProposalCancelled',
+    ],
+};
 const upsertEvent = async (event, tx = prisma_1.prisma) => {
     const data = event.data;
     if (event.contractId === config_1.config.contracts.treasury) {
+        if (!KNOWN_TOPICS.treasury.includes(event.topic)) {
+            throw new QuarantineError(`Unknown topic '${event.topic}' for treasury contract ${event.contractId}`);
+        }
         const rawAmount = extractAmount(data);
         const rawProposalId = extractProposalId(data);
         await tx.treasuryEvent.upsert({
@@ -97,6 +115,9 @@ const upsertEvent = async (event, tx = prisma_1.prisma) => {
         return;
     }
     if (event.contractId === config_1.config.contracts.payrollStream) {
+        if (!KNOWN_TOPICS.payrollStream.includes(event.topic)) {
+            throw new QuarantineError(`Unknown topic '${event.topic}' for payroll contract ${event.contractId}`);
+        }
         const streamId = extractStreamId(data);
         if (streamId === null && event.topic === 'StreamCreated') {
             throw new QuarantineError('StreamCreated event missing stream_id');
@@ -157,6 +178,9 @@ const upsertEvent = async (event, tx = prisma_1.prisma) => {
         return;
     }
     if (event.contractId === config_1.config.contracts.vesting) {
+        if (!KNOWN_TOPICS.vesting.includes(event.topic)) {
+            throw new QuarantineError(`Unknown topic '${event.topic}' for vesting contract ${event.contractId}`);
+        }
         const scheduleId = `v-${data.schedule_id ?? data.scheduleId ?? event.eventId}`;
         const statusMap = {
             VestingCreated: 'active',
@@ -181,6 +205,9 @@ const upsertEvent = async (event, tx = prisma_1.prisma) => {
         return;
     }
     if (event.contractId === config_1.config.contracts.governance) {
+        if (!KNOWN_TOPICS.governance.includes(event.topic)) {
+            throw new QuarantineError(`Unknown topic '${event.topic}' for governance contract ${event.contractId}`);
+        }
         const proposalId = `p-${data.proposal_id ?? data.proposalId ?? event.eventId}`;
         const statusMap = {
             ProposalCreated: 'active',
@@ -316,10 +343,30 @@ const createIndexerEngine = () => {
                 const latestLedger = response.latestLedger;
                 metrics_1.observedLedger.set(latestLedger);
                 const events = [];
+                let decodeFailureCount = 0;
                 for (const rawEvent of response.events) {
                     const decoded = (0, decoder_1.decodeEventData)(rawEvent);
                     if (decoded) {
                         events.push(decoded);
+                    }
+                    else {
+                        decodeFailureCount++;
+                        const contract = String(rawEvent?.contractId ?? 'unknown');
+                        metrics_1.decodeFailures.inc({ contract });
+                        const rawLedger = typeof rawEvent?.ledger === 'number' ? rawEvent.ledger : 0;
+                        const rawTxHash = String(rawEvent?.txHash ?? 'unknown');
+                        const rawEventId = String(rawEvent?.id ?? `invalid-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+                        await prisma_1.prisma.deadLetterEvent.create({
+                            data: {
+                                eventId: rawEventId,
+                                ledger: rawLedger,
+                                txHash: rawTxHash,
+                                contractId: contract,
+                                topic: 'DECODE_FAILURE',
+                                rawData: (rawEvent ?? {}),
+                                error: 'Visible decode failure: missing or invalid event envelope or unparsable ScVal XDR payload',
+                            },
+                        });
                     }
                 }
                 if (events.length > 0) {
@@ -330,7 +377,10 @@ const createIndexerEngine = () => {
                         metrics_1.lagSeconds.set(lag);
                     }
                     state.currentLedger = maxAppliedLedger;
-                    console.log(`Indexed ledger ${startLedger ?? 'latest'}: ${processed} events, ${quarantined} quarantined`);
+                    console.log(`Indexed ledger ${startLedger ?? 'latest'}: ${processed} events, ${quarantined + decodeFailureCount} quarantined`);
+                }
+                else if (decodeFailureCount > 0) {
+                    console.log(`Indexed ledger ${startLedger ?? 'latest'}: 0 events, ${decodeFailureCount} quarantined`);
                 }
                 else if (startLedger !== undefined) {
                     await prisma_1.prisma.indexerState.upsert({
